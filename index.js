@@ -3,6 +3,7 @@ import { config } from "dotenv";
 import { readFile, writeFile } from "fs/promises";
 import path from "path";
 import { fetchCurrentVersions, fetchPastVersions } from "./roblox_api.js";
+import express from "express";
 
 config();
 
@@ -10,7 +11,23 @@ const PREFIX = "!";
 const UPDATE_CHANNEL_ID = process.env.UPDATE_CHANNEL_ID;
 const POLL_INTERVAL = Number(process.env.POLL_INTERVAL) || 60;
 const STATE_FILE = path.join(process.cwd(), "lastState.json");
+const PORT = process.env.PORT || 3000;
 
+// プラットフォームアイコン
+const PLATFORM_ICONS = {
+  Windows: "🪟",
+  Mac: "🍏",
+  Android: "🤖",
+  iOS: "📱"
+};
+
+// Expressサーバー設定
+const app = express();
+app.get("/", (req, res) => {
+  res.send("Roblox Update Bot is running!");
+});
+
+// 状態管理
 async function loadState() {
   try {
     const raw = await readFile(STATE_FILE, "utf8");
@@ -34,10 +51,20 @@ function hasVersionChanged(old, cur) {
   return keys.some((k) => old[k] !== cur[k]);
 }
 
-function createPlatformField(key, version, date) {
+function createPlatformField(platform, data) {
+  const icon = PLATFORM_ICONS[platform] || "🔹";
+  const version = data?.version ?? "不明";
+  const date = data?.date ?? "不明";
+  const downloadUrl = data?.downloadUrl;
+  
+  let value = `${icon} **${platform}**\nVersion: \`${version}\`\nUpdated: ${date}`;
+  if (downloadUrl) {
+    value += `\n[Download](${downloadUrl})`;
+  }
+  
   return {
-    name: key,
-    value: `Version: \`${version ?? "不明"}\`\nUpdated: ${date ?? "不明"}`,
+    name: "\u200b",
+    value: value,
     inline: false,
   };
 }
@@ -45,27 +72,25 @@ function createPlatformField(key, version, date) {
 function createEmbed(title, current, past = null) {
   const fields = [];
 
-  // Current versions
-  fields.push(
-    createPlatformField("Windows", current.Windows, current.WindowsDate),
-    createPlatformField("Mac", current.Mac, current.MacDate),
-    createPlatformField("Android", current.Android, current.AndroidDate),
-    createPlatformField("iOS", current.iOS, current.iOSDate)
-  );
+  // 現在のバージョン
+  for (const [platform, data] of Object.entries(current)) {
+    fields.push(createPlatformField(platform, data));
+  }
 
   const embed = new EmbedBuilder()
     .setTitle(title)
-    .setDescription("Roblox のバージョン情報")
+    .setDescription("Roblox の最新バージョン情報")
     .addFields(...fields)
     .setColor(0x00ae86)
     .setTimestamp();
 
-  // Past versions (if provided)
+  // 過去のバージョン（オプション）
   if (past) {
-    const pastFields = [
-      createPlatformField("Windows", past.Windows, past.WindowsDate),
-      createPlatformField("Mac", past.Mac, past.MacDate)
-    ];
+    const pastFields = [];
+    for (const [platform, data] of Object.entries(past)) {
+      pastFields.push(createPlatformField(platform, data));
+    }
+    embed.addFields({ name: "---", value: "**Past Versions**", inline: false });
     embed.addFields(...pastFields);
   }
 
@@ -137,6 +162,7 @@ async function startPolling(client) {
   });
 }
 
+// Discord Bot起動
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -161,6 +187,11 @@ client.on("messageCreate", async (msg) => {
 
 client.on("error", (error) => {
   console.error("Discord client error:", error);
+});
+
+// HTTPサーバー起動
+app.listen(PORT, () => {
+  console.log(`HTTP server running on port ${PORT}`);
 });
 
 client.login(process.env.DISCORD_TOKEN).catch(error => {
