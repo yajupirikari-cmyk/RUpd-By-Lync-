@@ -14,11 +14,11 @@ const STATE_FILE = path.join(process.cwd(), "lastState.json");
 const PORT = process.env.PORT || 3000;
 const PLATFORMS = ["Windows", "Mac", "Android", "iOS"];
 
-// 環境変数検証
+// 必須環境変数チェック
 if (!process.env.DISCORD_TOKEN) throw new Error("DISCORD_TOKEN が設定されていません");
 if (!UPDATE_CHANNEL_ID) throw new Error("UPDATE_CHANNEL_ID が設定されていません");
 
-// プラットフォーム画像URL
+// プラットフォーム画像URL（公式ロゴ）
 const PLATFORM_IMAGES = {
   Windows: "https://www.roblox.com/assets/images/icons/windows-icon.png",
   Mac: "https://www.roblox.com/assets/images/icons/macos-icon.png",
@@ -26,30 +26,40 @@ const PLATFORM_IMAGES = {
   iOS: "https://www.roblox.com/assets/images/icons/ios-icon.png"
 };
 
+// Express（ヘルスチェック用）設定
+const app = express();
+app.get("/", (req, res) => {
+  res.send("Roblox Update Bot is running!");
+});
+app.listen(PORT, () => {
+  console.log(`HTTP server listening on port ${PORT}`);
+});
+
 // 状態管理
 async function loadState() {
   try {
     const raw = await readFile(STATE_FILE, "utf8");
     return JSON.parse(raw);
-  } catch (e) {
-    console.warn("状態ファイルが破損または存在しません。デフォルト状態に初期化します。");
+  } catch {
+    console.warn("状態ファイルが無いか破損しています。デフォルトで初期化します。");
     return { current: {}, past: {} };
   }
 }
-
 async function saveState(state) {
   try {
     await writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
   } catch (e) {
-    console.error("Failed to save state:", e);
+    console.error("状態保存失敗:", e);
   }
 }
 
+// バージョン変更判定
 function hasVersionChanged(old, cur) {
   if (!old) return true;
-  return PLATFORMS.some((k) => old[k] !== cur[k]);
+  return PLATFORMS.some((p) => old[p]?.version !== cur[p]?.version);
 }
 
+// 埋め込みメッセージ作成
 function createPlatformField(platform, data) {
   const version = data?.version ?? "不明";
   const date = data?.date ?? "不明";
@@ -57,29 +67,17 @@ function createPlatformField(platform, data) {
   const imageUrl = PLATFORM_IMAGES[platform];
 
   let value = `Version: \`${version}\`\nUpdated: ${date}`;
-  if (downloadUrl) {
-    value += `\n[Download](${downloadUrl})`;
-  }
+  if (downloadUrl) value += `\n[Download](${downloadUrl})`;
 
   return {
     name: platform,
-    value: value,
+    value,
     inline: false,
     ...(imageUrl && { thumbnail: { url: imageUrl } })
   };
 }
-
 function createEmbed(title, current, past = null) {
-  const fields = [];
-
-  // 現在のバージョン
-  for (const platform of PLATFORMS) {
-    const data = current[platform];
-    if (data) {
-      fields.push(createPlatformField(platform, data));
-    }
-  }
-
+  const fields = PLATFORMS.map((p) => createPlatformField(p, current[p])).filter(Boolean);
   const embed = new EmbedBuilder()
     .setTitle(title)
     .setDescription("Roblox の最新バージョン情報")
@@ -87,28 +85,18 @@ function createEmbed(title, current, past = null) {
     .setColor(0x00ae86)
     .setTimestamp();
 
-  // 過去のバージョン（オプション）
   if (past) {
-    const pastFields = [];
-    for (const platform of PLATFORMS) {
-      const data = past[platform];
-      if (data) {
-        pastFields.push(createPlatformField(platform, data));
-      }
-    }
+    const pastFields = PLATFORMS.map((p) => createPlatformField(p, past[p])).filter(Boolean);
     embed.addFields({ name: "Past Versions", value: "\u200b", inline: false });
     embed.addFields(...pastFields);
   }
-
   return embed;
 }
 
+// 手動コマンド処理
 async function handleUpdateCommand(message) {
   try {
-    const [current, past] = await Promise.all([
-      fetchCurrentVersions(),
-      fetchPastVersions()
-    ]);
+    const [current, past] = await Promise.all([fetchCurrentVersions(), fetchPastVersions()]);
     const embed = createEmbed("Roblox Update (Manual)", current, past);
     await message.channel.send({ embeds: [embed] });
   } catch (err) {
@@ -116,26 +104,22 @@ async function handleUpdateCommand(message) {
       const wait = err.remainingTime ?? "しばらく";
       await message.channel.send(`レート制限中です。${wait}秒後に再試行してください。`);
     } else {
-      console.error("Update command error:", err);
+      console.error("手動取得エラー:", err);
       await message.channel.send("アップデート情報の取得に失敗しました。");
     }
   }
 }
 
+// ポーリング開始
 async function startPolling(client) {
   let lastState = await loadState();
-  let isPolling = false;
+  let isRunning = false;
 
-  const intervalId = setInterval(async () => {
-    if (isPolling) return;
-    isPolling = true;
-
+  const timer = setInterval(async () => {
+    if (isRunning) return;
+    isRunning = true;
     try {
-      const [current, past] = await Promise.all([
-        fetchCurrentVersions(),
-        fetchPastVersions()
-      ]);
-
+      const [current, past] = await Promise.all([fetchCurrentVersions(), fetchPastVersions()]);
       if (hasVersionChanged(lastState?.current, current)) {
         const channel = client.channels.cache.get(UPDATE_CHANNEL_ID);
         if (channel?.isTextBased()) {
@@ -149,26 +133,26 @@ async function startPolling(client) {
       }
     } catch (err) {
       if (err.isRateLimit) {
-        console.warn(`Rate limited. Waiting ${err.remainingTime} seconds...`);
+        console.warn(`Rate limited, wait ${err.remainingTime}s`);
       } else {
-        console.error("Polling error:", err);
+        console.error("ポーリングエラー:", err);
       }
     } finally {
-      isPolling = false;
+      isRunning = false;
     }
   }, POLL_INTERVAL * 1000);
 
   process.on("SIGINT", () => {
-    clearInterval(intervalId);
+    clearInterval(timer);
     process.exit(0);
   });
   process.on("SIGTERM", () => {
-    clearInterval(intervalId);
+    clearInterval(timer);
     process.exit(0);
   });
 }
 
-// Discord Bot起動
+// Discord クライアント起動
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -191,21 +175,11 @@ client.on("messageCreate", async (msg) => {
   }
 });
 
-client.on("error", (error) => {
-  console.error("Discord client error:", error);
+client.on("error", (err) => {
+  console.error("Discord client error:", err);
 });
 
-// HTTPサーバー起動
-const app = express();
-app.get("/", (req, res) => {
-  res.send("Roblox Update Bot is running!");
-});
-
-app.listen(PORT, () => {
-  console.log(`HTTP server running on port ${PORT}`);
-});
-
-client.login(process.env.DISCORD_TOKEN).catch(error => {
-  console.error("Failed to login:", error);
+client.login(process.env.DISCORD_TOKEN).catch((err) => {
+  console.error("Discord login 失敗:", err);
   process.exit(1);
 });
